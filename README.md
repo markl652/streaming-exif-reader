@@ -57,7 +57,7 @@ message on stdout or an error on stderr instead of a stack trace.
 This is an early skeleton. It currently:
 
 - only understands JPEG containers (no TIFF, PNG, HEIC yet)
-- only parses IFD0 (no EXIF sub-IFD, no GPS IFD, no thumbnail IFD)
+- parses IFD0, the EXIF sub-IFD, and the GPS IFD (no thumbnail IFD yet)
 - decodes ASCII, SHORT, LONG, and RATIONAL field types; anything else is
   reported as present but unsupported rather than silently dropped
 

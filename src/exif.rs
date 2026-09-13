@@ -21,10 +21,18 @@ impl std::fmt::Display for ExifError {
     }
 }
 
+/// IFD0 tag whose value is the byte offset (from the start of the TIFF
+/// header) of the EXIF sub-IFD.
+const TAG_EXIF_IFD_POINTER: u16 = 0x8769;
+/// IFD0 tag whose value is the byte offset of the GPS IFD.
+const TAG_GPS_IFD_POINTER: u16 = 0x8825;
+
 #[derive(Debug)]
 pub struct ExifData {
     pub little_endian: bool,
     pub ifd0: Vec<IfdEntry>,
+    pub exif_ifd: Vec<IfdEntry>,
+    pub gps_ifd: Vec<IfdEntry>,
 }
 
 #[derive(Debug)]
@@ -70,7 +78,25 @@ pub fn parse(app1_data: &[u8]) -> Result<ExifData, ExifError> {
     let ifd0_offset = read_u32(tiff, 4, little_endian)? as usize;
     let ifd0 = parse_ifd(tiff, ifd0_offset, little_endian)?;
 
-    Ok(ExifData { little_endian, ifd0 })
+    let exif_ifd = match ifd_pointer(&ifd0, TAG_EXIF_IFD_POINTER) {
+        Some(offset) => parse_ifd(tiff, offset, little_endian)?,
+        None => Vec::new(),
+    };
+    let gps_ifd = match ifd_pointer(&ifd0, TAG_GPS_IFD_POINTER) {
+        Some(offset) => parse_ifd(tiff, offset, little_endian)?,
+        None => Vec::new(),
+    };
+
+    Ok(ExifData { little_endian, ifd0, exif_ifd, gps_ifd })
+}
+
+/// Looks up an IFD0 entry that points at another IFD (EXIF sub-IFD or
+/// GPS IFD) and returns its offset into the TIFF data, if present.
+fn ifd_pointer(ifd0: &[IfdEntry], tag: u16) -> Option<usize> {
+    ifd0.iter().find(|e| e.tag == tag).and_then(|e| match &e.value {
+        Value::Long(vals) => vals.first().map(|&v| v as usize),
+        _ => None,
+    })
 }
 
 fn parse_ifd(tiff: &[u8], offset: usize, le: bool) -> Result<Vec<IfdEntry>, ExifError> {
