@@ -199,3 +199,167 @@ fn read_u32(buf: &[u8], offset: usize, le: bool) -> Result<u32, ExifError> {
     let bytes = [b[0], b[1], b[2], b[3]];
     Ok(if le { u32::from_le_bytes(bytes) } else { u32::from_be_bytes(bytes) })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_u16(v: &mut Vec<u8>, val: u16, le: bool) {
+        v.extend_from_slice(if le { &val.to_le_bytes() } else { &val.to_be_bytes() });
+    }
+
+    fn push_u32(v: &mut Vec<u8>, val: u32, le: bool) {
+        v.extend_from_slice(if le { &val.to_le_bytes() } else { &val.to_be_bytes() });
+    }
+
+    /// Builds a full APP1 payload (Exif signature + TIFF header + IFD0)
+    /// with three entries: an inline SHORT, an inline ASCII string, and
+    /// an ASCII string too long to fit inline, forcing an out-of-line
+    /// read through the offset field. Same layout in both byte orders,
+    /// only the multi-byte fields' encoding changes.
+    fn sample_app1(le: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_SIGNATURE);
+        v.extend_from_slice(if le { b"II" } else { b"MM" });
+        push_u16(&mut v, 42, le);
+        push_u32(&mut v, 8, le); // IFD0 offset, right after the header
+
+        push_u16(&mut v, 3, le); // entry count
+
+        // Orientation: SHORT, count 1, value inline.
+        push_u16(&mut v, 0x0112, le);
+        push_u16(&mut v, 3, le);
+        push_u32(&mut v, 1, le);
+        push_u16(&mut v, 1, le);
+        push_u16(&mut v, 0, le); // padding to fill the 4-byte value slot
+
+        // Make: ASCII, count 3, "Co\0" inline.
+        push_u16(&mut v, 0x010F, le);
+        push_u16(&mut v, 2, le);
+        push_u32(&mut v, 3, le);
+        v.extend_from_slice(b"Co\0");
+        v.push(0);
+
+        // Model: ASCII, count 6, too big to inline, offset 46 points
+        // just past the end of this IFD0 structure.
+        push_u16(&mut v, 0x0110, le);
+        push_u16(&mut v, 2, le);
+        push_u32(&mut v, 6, le);
+        push_u32(&mut v, 46, le);
+
+        v.extend_from_slice(b"Canon\0");
+        v
+    }
+
+    fn single_entry_app1(field_type: u16, count: u32, raw: [u8; 4], le: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_SIGNATURE);
+        v.extend_from_slice(if le { b"II" } else { b"MM" });
+        push_u16(&mut v, 42, le);
+        push_u32(&mut v, 8, le);
+        push_u16(&mut v, 1, le);
+        push_u16(&mut v, 0x00FF, le); // arbitrary tag
+        push_u16(&mut v, field_type, le);
+        push_u32(&mut v, count, le);
+        v.extend_from_slice(&raw);
+        v
+    }
+
+    fn ascii_value<'a>(ifd0: &'a [IfdEntry], tag: u16) -> &'a str {
+        match &ifd0.iter().find(|e| e.tag == tag).unwrap().value {
+            Value::Ascii(s) => s,
+            other => panic!("expected Ascii for tag {tag:#06X}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_little_endian_ifd0() {
+        let data = parse(&sample_app1(true)).unwrap();
+        assert!(data.little_endian);
+        assert_eq!(data.ifd0.len(), 3);
+        match &data.ifd0.iter().find(|e| e.tag == 0x0112).unwrap().value {
+            Value::Short(vals) => assert_eq!(vals, &[1]),
+            other => panic!("expected Short, got {other:?}"),
+        }
+        assert_eq!(ascii_value(&data.ifd0, 0x010F), "Co");
+        assert_eq!(ascii_value(&data.ifd0, 0x0110), "Canon");
+    }
+
+    #[test]
+    fn parses_big_endian_ifd0() {
+        let data = parse(&sample_app1(false)).unwrap();
+        assert!(!data.little_endian);
+        assert_eq!(data.ifd0.len(), 3);
+        match &data.ifd0.iter().find(|e| e.tag == 0x0112).unwrap().value {
+            Value::Short(vals) => assert_eq!(vals, &[1]),
+            other => panic!("expected Short, got {other:?}"),
+        }
+        assert_eq!(ascii_value(&data.ifd0, 0x010F), "Co");
+        assert_eq!(ascii_value(&data.ifd0, 0x0110), "Canon");
+    }
+
+    #[test]
+    fn rejects_missing_exif_signature() {
+        match parse(b"not an exif app1 payload") {
+            Err(ExifError::NotExif) => {}
+            other => panic!("expected NotExif, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_bad_byte_order_marker() {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_SIGNATURE);
+        v.extend_from_slice(&[b'X', b'X', 0, 0, 0, 0, 0, 0]);
+        match parse(&v) {
+            Err(ExifError::BadTiffHeader) => {}
+            other => panic!("expected BadTiffHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_tiff_header_shorter_than_eight_bytes() {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_SIGNATURE);
+        v.extend_from_slice(b"II\x2A\x00");
+        match parse(&v) {
+            Err(ExifError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_ifd0_offset_outside_the_segment() {
+        let mut v = Vec::new();
+        v.extend_from_slice(EXIF_SIGNATURE);
+        v.extend_from_slice(b"II");
+        push_u16(&mut v, 42, true);
+        push_u32(&mut v, 1000, true); // nothing at that offset
+        match parse(&v) {
+            Err(ExifError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognized_type_without_a_decoder_becomes_unknown_value() {
+        // Field type 7 is UNDEFINED: a valid TIFF type with a known
+        // element size, but we don't decode it into anything specific.
+        let data = parse(&single_entry_app1(7, 2, [0xAA, 0xBB, 0, 0], true)).unwrap();
+        match &data.ifd0[0].value {
+            Value::Unknown { field_type, count } => {
+                assert_eq!(*field_type, 7);
+                assert_eq!(*count, 2);
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unrecognized_field_type() {
+        match parse(&single_entry_app1(13, 1, [0, 0, 0, 0], true)) {
+            Err(ExifError::UnsupportedType(13)) => {}
+            other => panic!("expected UnsupportedType(13), got {other:?}"),
+        }
+    }
+}

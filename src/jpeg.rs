@@ -145,3 +145,81 @@ impl<R: Read> SegmentReader<R> {
         Ok(u16::from_be_bytes(buf))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn rejects_missing_soi() {
+        let bytes = [0x00, 0x00];
+        match SegmentReader::new(Cursor::new(bytes)) {
+            Err(JpegError::NotAJpeg) => {}
+            other => panic!("expected NotAJpeg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reads_one_segment_then_stops_at_sos() {
+        let bytes = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE1, 0x00, 0x04, b'h', b'i', // APP1, length 4, payload "hi"
+            0xFF, 0xDA, // SOS
+        ];
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+
+        let seg = r.next_segment().unwrap().expect("expected one segment");
+        assert_eq!(seg.marker, MARKER_APP1);
+        assert_eq!(seg.data, b"hi");
+
+        assert!(r.next_segment().unwrap().is_none());
+    }
+
+    #[test]
+    fn skips_restart_markers_between_segments() {
+        let bytes = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xD0, // RST0, standalone, no length
+            0xFF, 0xE1, 0x00, 0x03, b'x', // APP1, length 3, payload "x"
+            0xFF, 0xD9, // EOI
+        ];
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+
+        let seg = r.next_segment().unwrap().expect("expected one segment");
+        assert_eq!(seg.marker, MARKER_APP1);
+        assert_eq!(seg.data, b"x");
+
+        assert!(r.next_segment().unwrap().is_none());
+    }
+
+    #[test]
+    fn stops_cleanly_when_stream_ends_before_another_marker() {
+        let bytes = [0xFF, 0xD8]; // SOI only, nothing after it
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        assert!(r.next_segment().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_length_field_that_cannot_cover_itself() {
+        let bytes = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE1, 0x00, 0x01, // APP1, length 1 (too small to include itself)
+        ];
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        match r.next_segment() {
+            Err(JpegError::Truncated) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_payload_that_ends_before_declared_length() {
+        let bytes = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE1, 0x00, 0x05, b'o', // APP1 claims 3 payload bytes, only 1 present
+        ];
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        assert!(r.next_segment().is_err());
+    }
+}
