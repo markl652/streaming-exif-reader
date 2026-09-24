@@ -27,9 +27,11 @@ bounded amount of memory:
 - It stops as soon as it hits the SOS marker, before the entropy-coded
   scan data. That data is never read, skipped, or buffered — the reader
   just returns `None` from that point on.
-- Only the APP1 segment holding the `Exif\0\0` signature is kept around
-  for parsing; every other segment's payload is read into a small,
-  spec-bounded buffer and then dropped.
+- The APP1 segment holding the `Exif\0\0` signature is kept around for
+  parsing; every other segment's payload is read into a small,
+  spec-bounded buffer and then dropped. If the Exif data doesn't fit in
+  one 65533-byte segment, the continuation APP1 segments some encoders
+  emit afterward are stitched back together automatically.
 
 The EXIF payload itself (TIFF header plus IFD0) is then parsed with
 bounds-checked offsets, so a truncated or malformed file produces an

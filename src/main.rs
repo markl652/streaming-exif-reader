@@ -33,32 +33,26 @@ fn main() -> ExitCode {
         }
     };
 
-    loop {
-        let segment = match segments.next_segment() {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                println!("no EXIF metadata found before the image data started");
-                return ExitCode::SUCCESS;
-            }
-            Err(e) => {
-                eprintln!("{e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        if segment.marker != jpeg::MARKER_APP1 || !segment.data.starts_with(jpeg::EXIF_SIGNATURE) {
-            continue; // APP1 can also carry XMP; skip anything that isn't Exif
+    let payload = match segments.next_exif_payload() {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            println!("no EXIF metadata found before the image data started");
+            return ExitCode::SUCCESS;
         }
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-        return match exif::parse(&segment.data) {
-            Ok(data) => {
-                pretty::print_report(&data);
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("invalid EXIF data: {e}");
-                ExitCode::FAILURE
-            }
-        };
+    match exif::parse(&payload) {
+        Ok(data) => {
+            pretty::print_report(&data);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("invalid EXIF data: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

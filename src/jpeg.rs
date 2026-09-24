@@ -4,6 +4,11 @@ use std::io::{self, Read};
 /// segment, right before the TIFF header.
 pub const EXIF_SIGNATURE: &[u8] = b"Exif\0\0";
 
+/// Prefix of Adobe's XMP packet, also carried in an APP1 segment. Used to
+/// recognize where a run of Exif continuation segments ends, since an XMP
+/// segment can legally follow an Exif one without any marker in between.
+pub const XMP_SIGNATURE_PREFIX: &[u8] = b"http://ns.adobe.com/xmp";
+
 pub const MARKER_APP1: u8 = 0xE1;
 
 const MARKER_EOI: u8 = 0xD9;
@@ -110,6 +115,41 @@ impl<R: Read> SegmentReader<R> {
         }
     }
 
+    /// Walks segments until it finds an APP1 segment carrying the Exif
+    /// signature, then returns its payload with any immediately following
+    /// continuation segments appended.
+    ///
+    /// The JPEG spec caps a segment's payload at 65533 bytes, which some
+    /// encoders exceed when the maker note or thumbnail is large. Rather
+    /// than truncate, they carry on writing the TIFF data into one or more
+    /// further APP1 segments with no signature of their own. We can't tell
+    /// those apart from an unrelated APP1 (most commonly XMP) by marker
+    /// alone, so we keep absorbing consecutive APP1 segments as long as
+    /// they don't look like the start of something else.
+    ///
+    /// Returns `None` if the scan data (or EOF) is reached without finding
+    /// an Exif segment.
+    pub fn next_exif_payload(&mut self) -> Result<Option<Vec<u8>>, JpegError> {
+        loop {
+            let segment = match self.next_segment()? {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            if segment.marker != MARKER_APP1 || !segment.data.starts_with(EXIF_SIGNATURE) {
+                continue;
+            }
+
+            let mut payload = segment.data;
+            loop {
+                match self.next_segment()? {
+                    Some(next) if is_exif_continuation(&next) => payload.extend_from_slice(&next.data),
+                    _ => break,
+                }
+            }
+            return Ok(Some(payload));
+        }
+    }
+
     fn read_byte(&mut self) -> Result<Option<u8>, JpegError> {
         let mut b = [0u8; 1];
         match self.inner.read_exact(&mut b) {
@@ -144,6 +184,15 @@ impl<R: Read> SegmentReader<R> {
         self.inner.read_exact(&mut buf)?;
         Ok(u16::from_be_bytes(buf))
     }
+}
+
+/// True if `segment` is an APP1 continuation of an Exif blob already in
+/// progress: same marker, but not the start of a fresh Exif block or an
+/// XMP packet.
+fn is_exif_continuation(segment: &Segment) -> bool {
+    segment.marker == MARKER_APP1
+        && !segment.data.starts_with(EXIF_SIGNATURE)
+        && !segment.data.starts_with(XMP_SIGNATURE_PREFIX)
 }
 
 #[cfg(test)]
@@ -221,5 +270,72 @@ mod tests {
         ];
         let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
         assert!(r.next_segment().is_err());
+    }
+
+    #[test]
+    fn next_exif_payload_returns_none_when_there_is_no_exif_segment() {
+        let bytes = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, 0x00, 0x04, b'J', b'F', // APP0 (JFIF), not Exif
+            0xFF, 0xDA, // SOS
+        ];
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        assert!(r.next_exif_payload().unwrap().is_none());
+    }
+
+    #[test]
+    fn next_exif_payload_stitches_together_continuation_segments() {
+        let mut bytes = vec![0xFF, 0xD8]; // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x0A]); // APP1, length 10
+        bytes.extend_from_slice(EXIF_SIGNATURE);
+        bytes.extend_from_slice(b"AA");
+        bytes.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x04]); // APP1 continuation, length 4
+        bytes.extend_from_slice(b"BB");
+        bytes.extend_from_slice(&[0xFF, 0xDA]); // SOS
+
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        let payload = r.next_exif_payload().unwrap().expect("expected a payload");
+
+        let mut expected = EXIF_SIGNATURE.to_vec();
+        expected.extend_from_slice(b"AABB");
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn next_exif_payload_stops_absorbing_at_an_xmp_segment() {
+        let mut bytes = vec![0xFF, 0xD8]; // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x0A]); // APP1, length 10
+        bytes.extend_from_slice(EXIF_SIGNATURE);
+        bytes.extend_from_slice(b"AA");
+        let xmp_payload = [XMP_SIGNATURE_PREFIX, b"/1.0/"].concat();
+        bytes.extend_from_slice(&[0xFF, 0xE1]);
+        bytes.extend_from_slice(&((xmp_payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(&xmp_payload);
+        bytes.extend_from_slice(&[0xFF, 0xDA]); // SOS
+
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        let payload = r.next_exif_payload().unwrap().expect("expected a payload");
+
+        let mut expected = EXIF_SIGNATURE.to_vec();
+        expected.extend_from_slice(b"AA");
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn next_exif_payload_stops_absorbing_at_a_different_marker() {
+        let mut bytes = vec![0xFF, 0xD8]; // SOI
+        bytes.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x0A]); // APP1, length 10
+        bytes.extend_from_slice(EXIF_SIGNATURE);
+        bytes.extend_from_slice(b"AA");
+        bytes.extend_from_slice(&[0xFF, 0xE2, 0x00, 0x04]); // APP2, unrelated
+        bytes.extend_from_slice(b"ZZ");
+        bytes.extend_from_slice(&[0xFF, 0xDA]); // SOS
+
+        let mut r = SegmentReader::new(Cursor::new(bytes)).unwrap();
+        let payload = r.next_exif_payload().unwrap().expect("expected a payload");
+
+        let mut expected = EXIF_SIGNATURE.to_vec();
+        expected.extend_from_slice(b"AA");
+        assert_eq!(payload, expected);
     }
 }
